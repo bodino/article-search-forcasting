@@ -1,20 +1,30 @@
 #!/usr/bin/env python
 """
-Generate search-augmented market data with leakage validation.
+Generate search-augmented data with optional leakage validation.
 
 Pipeline:
 1. Perform Perplexity search to discover article URLs
 2. Filter articles by publication date (before cutoff)
 3. Fetch full article content with trafilatura
-4. Validate no information leakage per-article via LLM-as-judge
+4. Validate no information leakage per-article via LLM-as-judge (if ground_truth provided)
 5. Output JSONL with original data + validated articles
 
-Example:
+Example (with leakage checking):
     uv run generate_search_augmented_data.py \
-        --dataset_path market_data/splits/test.jsonl \
-        --output_dir data/experiments/search_augmented \
-        --num_tasks 10 \
-        --openai_num_threads 20
+        --dataset_path data.jsonl \
+        --query_field "question" \
+        --date_field "created_at" \
+        --ground_truth_field "answer" \
+        --output_dir output/ \
+        --num_tasks 10
+
+Example (without leakage checking):
+    uv run generate_search_augmented_data.py \
+        --dataset_path data.jsonl \
+        --query_field "question" \
+        --date_field "created_at" \
+        --output_dir output/ \
+        --num_tasks 10
 """
 
 import asyncio
@@ -71,7 +81,13 @@ class SearchAugmentConfig(ExperimentConfigBase):
     """Configuration for search-augmented data generation."""
 
     dataset_path: str = field(metadata={"help": "Path to input JSONL dataset"})
-    num_tasks: int = field(default=10, metadata={"help": "Number of markets to process"})
+    query_field: str = field(metadata={"help": "Column name containing the search query/question"})
+    date_field: str = field(metadata={"help": "Column name containing the cutoff reference date"})
+    ground_truth_field: str | None = field(
+        default=None,
+        metadata={"help": "Column name for ground truth (enables leakage checking). If not provided, leakage checking is skipped."}
+    )
+    num_tasks: int = field(default=10, metadata={"help": "Number of rows to process"})
     num_searches_per_market: int = field(
         default=1, metadata={"help": "Number of Perplexity searches per market"}
     )
@@ -743,50 +759,47 @@ async def run_single_search_and_check(
             }
 
 
-async def process_single_market(
+async def process_single_row(
     api: InferenceAPI,
-    market: dict,
+    row: dict,
     config: SearchAugmentConfig,
     semaphore: asyncio.Semaphore,
 ) -> dict:
     """
-    Process a single market with article-based pipeline:
+    Process a single row with article-based pipeline:
     1. Perplexity search for article URLs
     2. Filter articles by publication date
     3. Fetch full content with trafilatura
-    4. Per-article leakage checking
+    4. Per-article leakage checking (if ground_truth_field provided)
     5. Return validated articles
     """
-    question_title = market["question_title"]
-    print(f"\n[Market] {question_title[:60]}...")
+    query = row[config.query_field]
+    ground_truth = row.get(config.ground_truth_field) if config.ground_truth_field else None
+    print(f"\n[Query] {query[:60]}...")
 
     # Parse dates
-    start_date_str = market["question_start_date"]
-    if "T" not in start_date_str:
-        question_start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    date_str = row[config.date_field]
+    if "T" not in date_str:
+        reference_date = datetime.strptime(date_str, "%Y-%m-%d")
     else:
-        question_start_date = datetime.fromisoformat(start_date_str)
+        reference_date = datetime.fromisoformat(date_str)
 
     # Calculate cutoff date
-    cutoff_date = question_start_date - timedelta(days=config.cutoff_days_before_start)
+    cutoff_date = reference_date - timedelta(days=config.cutoff_days_before_start)
     print(f"[Cutoff Date] {cutoff_date.strftime('%Y-%m-%d')}")
 
     # Step 1: Run Perplexity search to discover articles
     if config.use_background_prompt:
         search_prompt = await generate_background_prompt(
             api=api,
-            question_title=question_title,
-            resolution_criteria=market.get("resolution_criteria", ""),
+            question_title=query,
+            resolution_criteria="",
             cutoff_date=cutoff_date,
             model_id=config.prompt_model,
         )
         print(f"[Background Prompt] {search_prompt}")
     else:
-        search_prompt = (
-            "Find all the relevant articles and news for the following question.\n"
-            f"Question: {question_title}\n"
-            f"Resolution Criteria: {market.get('resolution_criteria', '')}"
-        )
+        search_prompt = f"Find all the relevant articles and news for the following query:\n{query}"
 
     async with semaphore:
         response_text, citations, search_results, reasoning_steps, fetched_contents = await perplexity_search(
@@ -861,39 +874,57 @@ async def process_single_market(
     else:
         successful_fetches = {}
 
-    # Step 4: Per-article leakage checking
+    # Step 4: Per-article leakage checking (only if ground_truth provided)
     validated_articles = []
     leaked_articles = []
     failed_articles = []
 
     if successful_fetches:
-        print(f"[Leakage Check] Checking {len(successful_fetches)} articles...")
-        leakage_tasks = [
-            check_article_leakage(
-                api=api,
-                question=question_title,
-                answer=market["answer"],
-                cutoff_date=cutoff_date,
-                article_url=url,
-                article_title=articles_to_fetch[url]["title"],
-                article_date=articles_to_fetch[url].get("date"),
-                article_content=content,
-                model_id=config.judge_model,
-                max_content_length=config.max_article_length,
-            )
-            for url, content in successful_fetches.items()
-        ]
+        if ground_truth:
+            # Leakage checking enabled
+            print(f"[Leakage Check] Checking {len(successful_fetches)} articles...")
+            leakage_tasks = [
+                check_article_leakage(
+                    api=api,
+                    question=query,
+                    answer=ground_truth,
+                    cutoff_date=cutoff_date,
+                    article_url=url,
+                    article_title=articles_to_fetch[url]["title"],
+                    article_date=articles_to_fetch[url].get("date"),
+                    article_content=content,
+                    model_id=config.judge_model,
+                    max_content_length=config.max_article_length,
+                )
+                for url, content in successful_fetches.items()
+            ]
 
-        leakage_results = await asyncio.gather(*leakage_tasks)
+            leakage_results = await asyncio.gather(*leakage_tasks)
 
-        # Separate leaked vs clean articles
-        clean_articles = []
-        for result in leakage_results:
-            if result["has_leakage"]:
-                leaked_articles.append(result)
-            else:
-                result["content"] = successful_fetches[result["url"]]
-                clean_articles.append(result)
+            # Separate leaked vs clean articles
+            clean_articles = []
+            for result in leakage_results:
+                if result["has_leakage"]:
+                    leaked_articles.append(result)
+                else:
+                    result["content"] = successful_fetches[result["url"]]
+                    clean_articles.append(result)
+        else:
+            # No leakage checking - all fetched articles are considered clean
+            print("[Leakage Check] Skipped (no ground_truth_field provided)")
+            clean_articles = [
+                {
+                    "url": url,
+                    "title": articles_to_fetch[url]["title"],
+                    "content": content,
+                    "has_leakage": None,
+                    "confidence": None,
+                    "explanation": "Leakage check skipped",
+                    "content_length": len(content),
+                    "content_preview": content[:500],
+                }
+                for url, content in successful_fetches.items()
+            ]
 
         # Step 5: Score relevance for clean articles
         if clean_articles:
@@ -901,8 +932,8 @@ async def process_single_market(
             relevance_tasks = [
                 score_article_relevance(
                     api=api,
-                    question=question_title,
-                    resolution_criteria=market.get("resolution_criteria", ""),
+                    question=query,
+                    resolution_criteria="",
                     article_url=article["url"],
                     article_title=article["title"],
                     article_content=article["content"],
@@ -936,9 +967,9 @@ async def process_single_market(
 
     print(f"[Result] Valid: {len(validated_articles)}, Leaked: {len(leaked_articles)}, Failed: {len(failed_articles)}")
 
-    # Calculate article leakage rate
+    # Calculate article leakage rate (only meaningful if leakage checking was done)
     total_checked = len(validated_articles) + len(leaked_articles)
-    article_leakage_rate = len(leaked_articles) / total_checked if total_checked > 0 else 0.0
+    article_leakage_rate = len(leaked_articles) / total_checked if total_checked > 0 and ground_truth else None
 
     # Build search context with article-based results
     search_context = {
@@ -948,6 +979,7 @@ async def process_single_market(
         "use_pro_search": config.use_pro_search,
         "use_background_prompt": config.use_background_prompt,
         "search_prompt": search_prompt,
+        "leakage_check_enabled": ground_truth is not None,
 
         # Discovery stats
         "num_articles_discovered": len(article_metadata),
@@ -960,16 +992,16 @@ async def process_single_market(
         "num_articles_fetched": len(successful_fetches),
         "num_articles_fetch_failed": len(failed_articles),
 
-        # Leakage stats
+        # Leakage stats (only populated if leakage checking enabled)
         "num_articles_validated": len(validated_articles),
-        "num_articles_leaked": len(leaked_articles),
-        "article_leakage_rate": round(article_leakage_rate, 4),
+        "num_articles_leaked": len(leaked_articles) if ground_truth else None,
+        "article_leakage_rate": round(article_leakage_rate, 4) if article_leakage_rate is not None else None,
 
         # The good stuff: validated articles with full content
         "validated_articles": validated_articles,  # Clean articles for RAG
 
         # Details for debugging
-        "leaked_articles": leaked_articles,  # Articles that leaked (no content, just metadata)
+        "leaked_articles": leaked_articles if ground_truth else [],  # Articles that leaked (no content, just metadata)
         "failed_articles": failed_articles,  # Articles that failed to fetch
 
         # Perplexity raw response (for reference)
@@ -977,19 +1009,19 @@ async def process_single_market(
         "perplexity_citations": citations,
     }
 
-    return {**market, "search_context": search_context}
+    return {**row, "search_context": search_context}
 
 
 async def process_and_save(
     api: InferenceAPI,
-    market: dict,
+    row: dict,
     config: SearchAugmentConfig,
     semaphore: asyncio.Semaphore,
     output_file,
     file_lock: asyncio.Lock,
 ) -> dict:
-    """Process a market and immediately write result to file."""
-    result = await process_single_market(api, market, config, semaphore)
+    """Process a row and immediately write result to file."""
+    result = await process_single_row(api, row, config, semaphore)
 
     # Write to file immediately with lock
     async with file_lock:
@@ -1007,93 +1039,121 @@ async def main():
 
     config.setup_experiment(log_file_prefix="search_augmented")
 
-    output_path = Path(config.output_dir) / "search_augmented_markets.jsonl"
+    output_path = Path(config.output_dir) / "search_augmented_data.jsonl"
 
-    # Load all markets from dataset
-    all_markets = []
+    # Load all rows from dataset
+    all_rows = []
     with open(config.dataset_path) as f:
         for line in f:
-            all_markets.append(json.loads(line))
+            all_rows.append(json.loads(line))
 
-    # Check for already-processed markets (resume support)
+    # Validate that required fields exist in first row
+    if all_rows:
+        first_row = all_rows[0]
+        missing_fields = []
+        if config.query_field not in first_row:
+            missing_fields.append(f"query_field '{config.query_field}'")
+        if config.date_field not in first_row:
+            missing_fields.append(f"date_field '{config.date_field}'")
+        if config.ground_truth_field and config.ground_truth_field not in first_row:
+            missing_fields.append(f"ground_truth_field '{config.ground_truth_field}'")
+
+        if missing_fields:
+            available = list(first_row.keys())
+            raise ValueError(
+                f"Missing fields in dataset: {', '.join(missing_fields)}\n"
+                f"Available fields: {available}"
+            )
+        LOGGER.info(f"Validated fields: query_field='{config.query_field}', date_field='{config.date_field}', "
+                    f"ground_truth_field='{config.ground_truth_field or 'None (leakage check disabled)'}'")
+
+    # Check for already-processed rows (resume support)
     processed_ids = set()
     if output_path.exists():
         with open(output_path) as f:
             for line in f:
                 try:
                     data = json.loads(line)
-                    # Use (question_title, resolution_criteria) as ID for uniqueness
-                    processed_ids.add((data.get("question_title"), data.get("resolution_criteria")))
+                    # Use query field value as ID for uniqueness
+                    processed_ids.add(data.get(config.query_field))
                 except json.JSONDecodeError:
                     continue
         if processed_ids:
-            LOGGER.info(f"Resuming: found {len(processed_ids)} already-processed markets")
+            LOGGER.info(f"Resuming: found {len(processed_ids)} already-processed rows")
 
-    # Randomly sample num_tasks markets (using seed for reproducibility)
-    if config.num_tasks < len(all_markets):
+    # Randomly sample num_tasks rows (using seed for reproducibility)
+    if config.num_tasks < len(all_rows):
         random.seed(config.seed)
-        markets = random.sample(all_markets, config.num_tasks)
-        LOGGER.info(f"Randomly selected {len(markets)} markets from {len(all_markets)} total (seed={config.seed})")
+        rows = random.sample(all_rows, config.num_tasks)
+        LOGGER.info(f"Randomly selected {len(rows)} rows from {len(all_rows)} total (seed={config.seed})")
     else:
-        markets = all_markets
-        LOGGER.info(f"Loaded all {len(markets)} markets from {config.dataset_path}")
+        rows = all_rows
+        LOGGER.info(f"Loaded all {len(rows)} rows from {config.dataset_path}")
 
-    # Filter out already-processed markets
-    markets_to_process = [m for m in markets if (m.get("question_title"), m.get("resolution_criteria")) not in processed_ids]
-    if len(markets_to_process) < len(markets):
-        LOGGER.info(f"Skipping {len(markets) - len(markets_to_process)} already-processed markets")
+    # Filter out already-processed rows
+    rows_to_process = [r for r in rows if r.get(config.query_field) not in processed_ids]
+    if len(rows_to_process) < len(rows):
+        LOGGER.info(f"Skipping {len(rows) - len(rows_to_process)} already-processed rows")
 
     # Initialize API
     api = InferenceAPI()
 
     # Create semaphores for rate limiting
     perplexity_semaphore = asyncio.Semaphore(config.perplexity_concurrency)
-    market_semaphore = asyncio.Semaphore(50)  # Max concurrent markets
+    row_semaphore = asyncio.Semaphore(50)  # Max concurrent rows
     file_lock = asyncio.Lock()
 
-    async def process_with_limit(market):
-        async with market_semaphore:
-            return await process_and_save(api, market, config, perplexity_semaphore, output_file, file_lock)
+    async def process_with_limit(row):
+        async with row_semaphore:
+            return await process_and_save(api, row, config, perplexity_semaphore, output_file, file_lock)
 
-    # Process markets
+    # Process rows
     search_mode_log = "Pro Search" if config.use_pro_search else "Basic Sonar"
     prompt_mode_log = "background prompts" if config.use_background_prompt else "direct prompts"
+    leakage_mode_log = "enabled" if config.ground_truth_field else "disabled"
     LOGGER.info(
-        f"Processing {len(markets_to_process)} markets "
-        f"(max 25 concurrent markets, {config.perplexity_concurrency} concurrent Perplexity calls, "
-        f"{search_mode_log}, {prompt_mode_log})"
+        f"Processing {len(rows_to_process)} rows "
+        f"(max 50 concurrent, {config.perplexity_concurrency} concurrent Perplexity calls, "
+        f"{search_mode_log}, {prompt_mode_log}, leakage check {leakage_mode_log})"
     )
 
     # Open file in append mode and process with live saving
     with open(output_path, "a") as output_file:
         tasks = [
-            process_with_limit(market)
-            for market in markets_to_process
+            process_with_limit(row)
+            for row in rows_to_process
         ]
-        results = await tqdm_asyncio.gather(*tasks, desc="Processing markets")
+        results = await tqdm_asyncio.gather(*tasks, desc="Processing rows")
 
     # Calculate stats for article-based pipeline
     total_discovered = sum(r["search_context"]["num_articles_discovered"] for r in results)
     total_fetched = sum(r["search_context"]["num_articles_fetched"] for r in results)
     total_validated = sum(r["search_context"]["num_articles_validated"] for r in results)
-    total_leaked = sum(r["search_context"]["num_articles_leaked"] for r in results)
     total_failed = sum(r["search_context"]["num_articles_fetch_failed"] for r in results)
     total_filtered_by_date = sum(r["search_context"]["num_articles_after_cutoff"] for r in results)
 
-    total_checked = total_validated + total_leaked
-    avg_leakage_rate = total_leaked / total_checked if total_checked > 0 else 0.0
-
-    LOGGER.info(f"Discovered: {total_discovered}, Fetched: {total_fetched}, Validated: {total_validated}, Leaked: {total_leaked}")
+    # Leakage stats only if leakage checking was enabled
+    if config.ground_truth_field:
+        total_leaked = sum(r["search_context"]["num_articles_leaked"] or 0 for r in results)
+        total_checked = total_validated + total_leaked
+        avg_leakage_rate = total_leaked / total_checked if total_checked > 0 else 0.0
+        LOGGER.info(f"Discovered: {total_discovered}, Fetched: {total_fetched}, Validated: {total_validated}, Leaked: {total_leaked}")
+    else:
+        total_leaked = None
+        avg_leakage_rate = None
+        LOGGER.info(f"Discovered: {total_discovered}, Fetched: {total_fetched}, Validated: {total_validated}")
 
     search_mode = "Pro Search" if config.use_pro_search else "Basic Sonar"
     prompt_mode = "Background (LLM-generated)" if config.use_background_prompt else "Direct"
+    leakage_mode = "Enabled" if config.ground_truth_field else "Disabled"
 
     print(f"\n{'='*70}")
     print(f"Output saved to: {output_path}")
     print(f"{'='*70}")
-    print(f"Markets processed: {len(results)}")
+    print(f"Rows processed: {len(results)}")
     print(f"Perplexity model: {config.perplexity_model} ({search_mode})")
     print(f"Prompt mode: {prompt_mode}")
+    print(f"Leakage checking: {leakage_mode}")
     print(f"{'='*70}")
     print("ARTICLE PIPELINE STATS:")
     print(f"  Articles discovered (Perplexity): {total_discovered}")
@@ -1101,19 +1161,29 @@ async def main():
     print(f"  Articles fetched (trafilatura):  {total_fetched}")
     print(f"  Articles fetch failed:           {total_failed}")
     print(f"{'='*70}")
-    print("LEAKAGE STATS (per-article):")
-    print(f"  Articles validated (clean):      {total_validated}")
-    print(f"  Articles leaked:                 {total_leaked}")
-    print(f"  Article leakage rate:            {avg_leakage_rate:.1%}")
-    print(f"{'='*70}")
-    print("\nPer-market breakdown:")
-    for r in results:
-        ctx = r["search_context"]
-        q = r["question_title"][:50]
-        v = ctx["num_articles_validated"]
-        l = ctx["num_articles_leaked"]
-        rate = ctx["article_leakage_rate"]
-        print(f"  {q}... : {v} valid, {l} leaked ({rate:.0%})")
+    if config.ground_truth_field:
+        print("LEAKAGE STATS (per-article):")
+        print(f"  Articles validated (clean):      {total_validated}")
+        print(f"  Articles leaked:                 {total_leaked}")
+        print(f"  Article leakage rate:            {avg_leakage_rate:.1%}")
+        print(f"{'='*70}")
+        print("\nPer-row breakdown:")
+        for r in results:
+            ctx = r["search_context"]
+            q = r[config.query_field][:50]
+            v = ctx["num_articles_validated"]
+            l = ctx["num_articles_leaked"]
+            rate = ctx["article_leakage_rate"]
+            print(f"  {q}... : {v} valid, {l} leaked ({rate:.0%})")
+    else:
+        print(f"Total validated articles: {total_validated}")
+        print(f"{'='*70}")
+        print("\nPer-row breakdown:")
+        for r in results:
+            ctx = r["search_context"]
+            q = r[config.query_field][:50]
+            v = ctx["num_articles_validated"]
+            print(f"  {q}... : {v} articles")
 
 
 if __name__ == "__main__":
