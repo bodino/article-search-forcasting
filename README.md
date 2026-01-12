@@ -18,7 +18,7 @@ This tool augments datasets with relevant web articles fetched via Perplexity se
 ## Installation
 
 ```bash
-pip install trafilatura perplexity-python safetytooling simple-parsing tqdm
+uv add trafilatura perplexity-python safetytooling simple-parsing tqdm
 ```
 
 ## Environment Variables
