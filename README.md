@@ -149,6 +149,27 @@ JSONL file with original data plus `search_context`:
 - **Date filtering** - Articles after cutoff are excluded before fetching
 - **Parallel processing** - Concurrent Perplexity searches and article fetches
 
+## Leakage Reviewer
+
+A simple web interface to manually review articles for information leakage.
+
+```bash
+uv run leakage_reviewer.py \
+    --data_path search_augmented_data.jsonl \
+    --query_field "question_title" \
+    --answer_field "answer" \
+    --num_samples 100 \
+    --port 8765
+```
+
+Then open http://localhost:8765 in your browser.
+
+Features:
+- Shows one question at a time with top 3 articles
+- Click articles to toggle between LEAKS/SAFE
+- Annotations auto-save to `leakage_annotations.json`
+- Progress tracking across sessions
+
 ## License
 
 MIT
