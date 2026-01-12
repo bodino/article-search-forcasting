@@ -1,4 +1,6 @@
-# Article Search for Forecasting
+# Working time restricted search: if you want to build a forcaster
+
+
 
 Generate search-augmented data with optional leakage validation for forecasting tasks.
 
