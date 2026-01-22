@@ -1,4 +1,4 @@
-# Working time restricted search: if you want to build a forcaster
+# Working time restricted search: if you want to build a forecaster
 
 
 
